@@ -2588,7 +2588,7 @@ function _islGetFiltered() {
       const rp = r._inv_plants || "";
       if (!rp.split(" · ").some(p => p.trim() === plant)) return false;
     }
-    if (flag && r._flag !== flag) return false;
+    if (flag && r._receiptFlag !== flag) return false;
     return true;
   });
 }
@@ -2632,6 +2632,64 @@ function _islReceiptFlagLabel(flag) {
   if (flag === "red")        return `<span class="isl-flag-red">🔴 &lt;1.5yr</span>`;
   if (flag === "data_error") return `<span style="background:#a371f7;color:#fff;padding:1px 6px;border-radius:4px;font-weight:700;font-size:0.72rem">⚠ Data Error</span>`;
   return `<span class="isl-flag-grey">—</span>`;
+}
+
+// ── MATERIAL SEARCH — ISL page ───────────────────────────────────────────
+function renderIslSearch() {
+  const query     = document.getElementById("isl-search-input").value.trim().toLowerCase();
+  const resultsEl = document.getElementById("isl-search-results");
+
+  if (!query) {
+    resultsEl.innerHTML = "";
+    return;
+  }
+  if (!incomingRaw.length) {
+    resultsEl.innerHTML = `<div class="alert-info">No incoming shelf life data loaded yet.</div>`;
+    return;
+  }
+
+  const matches = _islGetFiltered().filter(r => {
+    const code = String(r["Material"] || "").toLowerCase();
+    const desc = String(r["Material Description"] || "").toLowerCase();
+    return code.includes(query) || desc.includes(query);
+  });
+
+  if (!matches.length) {
+    resultsEl.innerHTML = `<div class="alert-info">No records found matching "<b>${escHtml(query)}</b>".</div>`;
+    return;
+  }
+
+  const uniqueMats = [...new Set(matches.map(r => r["Material"]))];
+  const summary = `<div style="font-size:0.78rem;color:var(--muted);margin-bottom:0.5rem">
+    Found <b style="color:var(--text)">${matches.length}</b> record(s) across
+    <b style="color:var(--text)">${uniqueMats.length}</b> material code(s)
+  </div>`;
+
+  const COLS = [
+    { key:"Material",             label:"Material Code" },
+    { key:"Material Description", label:"Material Description" },
+    { key:"Batch",                label:"Batch" },
+    { key:"_vt",                  label:"Val. Type" },
+    { key:"Storage Location",     label:"HO01 Receipt Sloc",
+      fmt: v => v ? escHtml(String(v)) : "—", raw: true },
+    { key:"_postingDate",         label:"Latest Posting Date",
+      fmt: v => v ? fmtLocalDate(v) : "—" },
+    { key:"_inv_expiryDate",      label:"Expiry Date (Inv)",
+      fmt: v => v instanceof Date ? fmtLocalDate(v) : (v ? String(v) : "—") },
+    { key:"_slAtReceiptDays",     label:"SL at Receipt (days)", fmt: v => _islFmtDays(v) },
+    { key:"_receiptFlag",         label:"SL at Receipt Flag",
+      fmt: v => _islReceiptFlagLabel(v), raw: true },
+    { key:"_remainingSL",         label:"SL Remaining Today (days)", fmt: v => _islFmtDays(v) },
+    { key:"_inv_totalQty",        label:"Total Inv. Qty",
+      fmt: v => (v !== undefined && v !== null) ? fmtQty(v) : "—" },
+  ];
+
+  resultsEl.innerHTML = summary + buildTable(matches, COLS);
+}
+
+function clearIslSearch() {
+  document.getElementById("isl-search-input").value = "";
+  document.getElementById("isl-search-results").innerHTML = "";
 }
 
 function renderIncomingShelfLife() {
@@ -2727,7 +2785,7 @@ function renderIncomingShelfLife() {
     // ── Current inventory distribution (all branches) ──
     { key:"_inv_plants",          label:"Plants in Inventory",
       fmt: v => v ? `<span style="font-size:0.7rem;white-space:nowrap">${escHtml(String(v))}</span>` : "—", raw: true },
-    { key:"_inv_slocs",           label:"Inventory Slocs",
+    { key:"_inv_slocs",           label:"Storage Location",
       fmt: v => v ? `<span style="font-size:0.68rem;color:var(--muted);white-space:nowrap">${escHtml(String(v))}</span>` : "—", raw: true },
     { key:"_inv_totalQty",        label:"Total Inv. Qty",
       fmt: v => (v !== undefined && v !== null) ? fmtQty(v) : "—" },
@@ -2775,7 +2833,7 @@ function renderIncomingShelfLife() {
       "SL at Receipt Flag":       RECEIPT_FLAG_LABEL[r._receiptFlag] || r._receiptFlag || "",
       "SL Remaining Today (days)": r._remainingSL !== null && r._remainingSL !== undefined ? r._remainingSL : "",
       "Plants in Inventory":      r._inv_plants  || "",
-      "Inventory Slocs":          r._inv_slocs   || "",
+      "Storage Location":          r._inv_slocs   || "",
       "Total Inv. Qty":           r._inv_totalQty !== undefined ? r._inv_totalQty : "",
     };
   }
@@ -2788,7 +2846,7 @@ function renderIncomingShelfLife() {
     "GR Document No. (latest)","Expiry Date (Inv)",
     "SL at Receipt (days)","SL at Receipt Flag",
     "SL Remaining Today (days)",
-    "Plants in Inventory","Inventory Slocs","Total Inv. Qty",
+    "Plants in Inventory","Storage Location","Total Inv. Qty",
   ];
   const exportColDefs = EXPORT_KEYS.map(k => ({ key: k, label: k }));
 
@@ -2947,6 +3005,13 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("flow-search-clear").addEventListener("click", clearFlowSearch);
   document.getElementById("flow-search-input").addEventListener("keydown", e => {
     if (e.key === "Enter") renderFlowSearch();
+  });
+
+  // ISL material search
+  document.getElementById("isl-search-btn").addEventListener("click", renderIslSearch);
+  document.getElementById("isl-search-clear").addEventListener("click", clearIslSearch);
+  document.getElementById("isl-search-input").addEventListener("keydown", e => {
+    if (e.key === "Enter") renderIslSearch();
   });
 
   // Preview filters
