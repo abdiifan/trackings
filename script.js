@@ -2180,36 +2180,47 @@ function loadIncomingFile(file) {
         });
 
         // Parse fields from received goods file.
-        // BUG-ISL-1 FIX: Production Date and Expiry Date are NOT parsed here —
-        // they come from inventory (SAP master) during _islCrossMatchInventory().
-        // Only Posting Date and Valuation Type are sourced from this file.
+        // ISSUE-1 FIX: Expiry Date comes from inventory (SAP master) during
+        // _islCrossMatchInventory(). Posting Date and Valuation Type are
+        // sourced from this file.
         rows.forEach(r => {
           r._postingDate = _islParseDate(r["Posting Date"]);
           r._vt          = _islExtractVT(r);
-          // SL metrics will be computed in _islCrossMatchInventory once
-          // inventory dates are resolved; initialise to grey for safety
-          r._totalSL     = null;
-          r._remainingSL = null;
-          r._ratio       = null;
-          r._flag        = "grey";
+          // SL metrics computed in _islCrossMatchInventory once inventory
+          // expiry dates are resolved; initialise to grey for safety
+          r._slAtReceiptDays = null;
+          r._receiptFlag     = "grey";
+          r._remainingSL     = null;
+          r._ratio           = null;
+          r._flag            = "grey";
+          r._isExpired       = false;
+          r._dataError       = false;
           // Inventory enrichment fields — populated by _islCrossMatchInventory
           r._inv_plants   = "—";
           r._inv_slocs    = "—";
           r._inv_totalQty = 0;
-          r._inv_prodDate   = null;
           r._inv_expiryDate = null;
           r._inInventory    = null;
         });
 
         // Store all parsed HO01/ZME+ZMS+ZLC rows before cross-match
         incomingRaw = rows;
+        // ISSUE-7 NOTE: .slice() is a shallow copy — the row objects
+        // themselves are shared between incomingRaw and _incomingRawAll.
+        // This is intentional/fine: _islCrossMatchInventory() mutates those
+        // shared objects (_inv_*, _flag, etc.) in place, and _incomingRawAll
+        // is fully reassigned (not appended to) on the next loadIncomingFile()
+        // call, so stale references never leak across file loads.
         _incomingRawAll = rows.slice(); // preserve full list for re-matching
 
         // ISL-MATCH: cross-match against inventory — keep only rows whose
-        // Material + Batch combination exists somewhere in rawDf (any branch).
-        // If inventory hasn't been loaded yet we keep all rows and re-match
-        // when the inventory file is eventually uploaded (see recomputeIslMatch).
-        if (rawDf.length) _islCrossMatchInventory();
+        // Material + Batch combination exists somewhere in rawDf (any branch),
+        // enrich with inventory expiry/plant/qty, compute SL metrics, and
+        // group duplicate receipts by Material+Batch (ISSUE-2).
+        // Always run — even without inventory loaded yet — so grouping is
+        // applied; re-matched again once inventory is uploaded (see
+        // recomputeIslMatch).
+        _islCrossMatchInventory();
 
         const n = incomingRaw.length;
         const loadedTotal = rows.length;
@@ -2225,8 +2236,9 @@ function loadIncomingFile(file) {
         document.getElementById("incoming-no-file").style.display = "none";
         document.getElementById("incoming-content").style.display = "block";
 
-        if (currentPage === "incoming") renderIncomingShelfLife();
-        else renderPage("incoming");
+        // ISSUE-8 FIX: always go through renderPage so currentPage is set
+        // consistently, regardless of which page we're currently on.
+        renderPage("incoming");
       } catch(err) {
         statusEl.innerHTML = `<div class="status-ok" style="color:var(--red)">⚠ Error: ${escHtml(err.message)}</div>`;
       }
@@ -2256,93 +2268,122 @@ function loadIncomingFile(file) {
 let _incomingRawAll = [];   // full parsed HO01 list, unfiltered by inventory
 
 /**
- * Builds a Set of "material||batch" keys from rawDf (all branches)
- * then keeps only incomingRaw rows whose key is present.
- * Also stamps r._inInventory = true/false on every row in _incomingRawAll
- * so callers can optionally inspect what was dropped.
+ * Builds a lookup from rawDf (all branches) keyed by "material||batch",
+ * enriches each received-goods row with inventory-derived fields
+ * (_inv_expiryDate, _inv_plants, _inv_slocs, _inv_totalQty), computes the
+ * shelf-life metrics via _islCompute(), stamps r._inInventory, and finally
+ * groups rows by Material+Batch (ISSUE-2 FIX) so duplicate/partial-delivery
+ * receipts collapse into a single reference row per batch.
+ *
+ * incomingRaw ends up holding the GROUPED, matched rows used for display.
+ * _incomingRawAll retains the full ungrouped list (for KPIs/match counts).
  */
-function _islBuildInvMap() {
-  // Returns Map: "MATERIAL||BATCH" -> array of all rawDf rows for that batch
-  const map = new Map();
+function _islCrossMatchInventory() {
+  if (!rawDf.length) {
+    // Inventory not yet loaded — show everything, mark unknown
+    _incomingRawAll.forEach(r => { r._inInventory = null; });
+    incomingRaw = _islGroupByMaterialBatch(_incomingRawAll);
+    return;
+  }
+
+  // Build lookup map from inventory (all branches): key -> { expiry, plants:Set, slocs:Set, totalQty }
+  const invMap = new Map();
   rawDf.forEach(r => {
     const mat   = String(r["Material"] || "").trim().toUpperCase();
     const batch = String(r["Batch"]    || "").trim().toUpperCase();
     if (!mat || !batch) return;
-    const key = mat + "||" + batch;
-    if (!map.has(key)) map.set(key, []);
-    map.get(key).push(r);
+    const key = `${mat}||${batch}`;
+    let entry = invMap.get(key);
+    if (!entry) {
+      entry = { expiry: null, plants: new Set(), slocs: new Set(), totalQty: 0 };
+      invMap.set(key, entry);
+    }
+    if (r._expiry instanceof Date && !entry.expiry) entry.expiry = r._expiry;
+    const plant = String(r["Plant"] || "").trim().toUpperCase();
+    if (plant) entry.plants.add(plant);
+    const sloc = String(r["Storage Location"] || "").trim();
+    if (sloc) entry.slocs.add(sloc);
+    entry.totalQty += (Number(r["Total Qty"]) || 0);
   });
-  return map;
+
+  // Stamp, enrich, and compute SL metrics
+  _incomingRawAll.forEach(r => {
+    const mat   = String(r["Material"] || "").trim().toUpperCase();
+    const batch = String(r["Batch"]    || "").trim().toUpperCase();
+    const key   = `${mat}||${batch}`;
+    const entry = (mat && batch) ? invMap.get(key) : undefined;
+    r._inInventory = !!entry;
+
+    if (entry) {
+      r._inv_expiryDate = entry.expiry;
+      r._inv_plants     = entry.plants.size ? [...entry.plants].sort().join(" · ") : "—";
+      r._inv_slocs      = entry.slocs.size  ? [...entry.slocs].sort().join(" · ")  : "—";
+      r._inv_totalQty   = entry.totalQty;
+    } else {
+      r._inv_expiryDate = null;
+      r._inv_plants     = "—";
+      r._inv_slocs      = "—";
+      r._inv_totalQty   = 0;
+    }
+
+    const sl = _islCompute(r._inv_expiryDate, r._postingDate);
+    r._slAtReceiptDays = sl.slAtReceiptDays;
+    r._receiptFlag     = sl.receiptFlag;
+    r._remainingSL     = sl.remainingSLDays;
+    r._ratio           = sl.ratio;
+    r._flag            = sl.flag;
+    r._isExpired       = sl.isExpired;
+    r._dataError       = sl.dataError;
+  });
+
+  const matched = _incomingRawAll.filter(r => r._inInventory === true);
+  incomingRaw = _islGroupByMaterialBatch(matched);
 }
 
-function _islCrossMatchInventory() {
-  if (!rawDf.length) {
-    // Inventory not yet loaded — pass through all, mark unknown
-    _incomingRawAll.forEach(r => { r._inInventory = null; });
-    incomingRaw = _incomingRawAll.slice();
-    return;
+/**
+ * ISSUE-2 FIX: group received-goods rows by Material+Batch.
+ *   • The row with the LATEST Posting Date becomes the reference receipt
+ *     (its dates/flags/SL metrics are shown).
+ *   • _groupedQty = sum of received quantities across all rows in the group.
+ *   • _receiptCount = number of GR postings collapsed into this row.
+ * Rows without a usable quantity column contribute 0 to _groupedQty.
+ */
+function _islGetRowQty(r) {
+  const candidates = ["Quantity", "Posted Quantity", "Quantity in Unit of Entry",
+    "GR Quantity", "Order Quantity", "Total Qty"];
+  for (const c of candidates) {
+    if (r[c] !== undefined && r[c] !== "") {
+      const n = parseFloat(r[c]);
+      if (!isNaN(n)) return n;
+    }
   }
+  return 0;
+}
 
-  const invMap = _islBuildInvMap();
-
-  _incomingRawAll.forEach(r => {
-    const mat     = String(r["Material"] || "").trim().toUpperCase();
-    const batch   = String(r["Batch"]    || "").trim().toUpperCase();
-    const key     = mat + "||" + batch;
-    const invRows = invMap.get(key);
-
-    if (!invRows || !invRows.length) {
-      r._inInventory = false;
-      return;
-    }
-    r._inInventory = true;
-
-    // ── Plants currently holding this batch (all branches, deduplicated) ──
-    const plants = [...new Set(invRows.map(ir => {
-      const p  = String(ir["Plant"]      || "").trim();
-      const pn = String(ir["Plant Name"] || "").trim();
-      return p ? (pn ? p + " – " + pn : p) : "";
-    }))].filter(Boolean).sort();
-    r._inv_plants = plants.join(" · ") || "—";
-
-    // ── Plant / Storage Location pairs ──
-    const slocs = [...new Set(invRows.map(ir => {
-      const p  = String(ir["Plant"]                           || "").trim();
-      const sl = String(ir["Storage Location"]                || "").trim();
-      const sd = String(ir["Description of Storage Location"] || "").trim();
-      return sl ? (p + "/" + sl + (sd ? " (" + sd + ")" : "")) : "";
-    }))].filter(Boolean).sort();
-    r._inv_slocs = slocs.join(" · ") || "—";
-
-    // ── Total unrestricted qty across all inventory rows for this batch ──
-    r._inv_totalQty = invRows.reduce(function(s, ir) {
-      return s + (parseFloat(ir["Unrestricted Stock"]) || 0);
-    }, 0);
-
-    // ── Dates: authoritative source is inventory (SAP master) ──
-    // BUG-ISL-1 FIX: do NOT use dates from received goods file
-    function findInvDate(col) {
-      for (var i = 0; i < invRows.length; i++) {
-        var d = _islParseDate(invRows[i][col]);
-        if (d) return d;
-      }
-      return null;
-    }
-    r._inv_prodDate   = findInvDate("Production Date") ||
-                        findInvDate("Mfg Date")        ||
-                        findInvDate("Manufacturing Date");
-    r._inv_expiryDate = findInvDate("Shelf Life Expiration Date") ||
-                        findInvDate("Expiry Date");
-
-    // ── Recompute shelf life using inventory dates + received posting date ──
-    var sl = _islCompute(r._inv_prodDate, r._inv_expiryDate, r._postingDate);
-    r._totalSL     = sl.totalSL;
-    r._remainingSL = sl.remainingSL;
-    r._ratio       = sl.ratio;
-    r._flag        = sl.flag;
+function _islGroupByMaterialBatch(rows) {
+  const groups = new Map();
+  rows.forEach(r => {
+    const mat   = String(r["Material"] || "").trim().toUpperCase();
+    const batch = String(r["Batch"]    || "").trim().toUpperCase();
+    const key   = `${mat}||${batch}`;
+    let g = groups.get(key);
+    if (!g) { g = []; groups.set(key, g); }
+    g.push(r);
   });
 
-  incomingRaw = _incomingRawAll.filter(function(r) { return r._inInventory === true; });
+  const result = [];
+  groups.forEach(g => {
+    // Pick the row with the latest posting date as the reference
+    let ref = g[0];
+    for (const r of g) {
+      const a = ref._postingDate ? ref._postingDate.getTime() : -Infinity;
+      const b = r._postingDate   ? r._postingDate.getTime()   : -Infinity;
+      if (b > a) ref = r;
+    }
+    const totalQty = g.reduce((sum, r) => sum + _islGetRowQty(r), 0);
+    result.push({ ...ref, _groupedQty: totalQty, _receiptCount: g.length });
+  });
+  return result;
 }
 
 /**
@@ -2352,16 +2393,23 @@ function _islCrossMatchInventory() {
 function recomputeIslMatch() {
   if (!_incomingRawAll.length) return; // no received goods uploaded yet
   _islCrossMatchInventory();
-  // Update sidebar status note
+  if (currentPage === "incoming") renderIncomingShelfLife();
+  // Update the status line to reflect new match count
   const statusEl = document.getElementById("incomingFileStatus");
   if (statusEl && statusEl.style.display !== "none") {
-    statusEl.innerHTML = statusEl.innerHTML.replace(
-      / · [\d,]+ matched in inventory| · Upload inventory to cross-match/,
-      " · " + incomingRaw.length.toLocaleString() + " matched in inventory"
-    );
+    const total   = _incomingRawAll.length;
+    const matched = incomingRaw.length;
+    const existing = statusEl.innerHTML;
+    // Replace the last status-name line (match note) or append it
+    if (existing.includes("matched in inventory") || existing.includes("Upload inventory")) {
+      statusEl.innerHTML = existing.replace(
+        / · [\d,]+ matched in inventory| · Upload inventory to cross-match/,
+        ` · ${matched.toLocaleString()} matched in inventory`
+      );
+    }
   }
-  _islPopulateFilters();
-  if (currentPage === "incoming") renderIncomingShelfLife();
+  // Re-populate ISL filters since the dataset changed
+  if (_incomingRawAll.length) _islPopulateFilters();
 }
 
 function _islExtractVT(row) {
@@ -2400,24 +2448,71 @@ function _islParseDate(v) {
   return null;
 }
 
-function _islCompute(prodDate, expiryDate, postingDate) {
+// ISSUE-1 FIX: There are now TWO distinct shelf-life metrics:
+//   • SL at Receipt   = Expiry Date − Posting Date (supplier compliance check,
+//                        evaluated at the moment goods were received)
+//   • SL Remaining    = Expiry Date − TODAY (distribution urgency, what's
+//                        actually left right now)
+// "flag" (used for KPIs, chart, and the bar in the table) is driven by
+// SL Remaining (Today), since that's what matters operationally.
+// "receiptFlag" classifies SL at Receipt using year-based thresholds:
+//   < 1.5 yr  → red     (supplier delivered with inadequate shelf life)
+//   1.5-2 yr  → yellow  (borderline, watch)
+//   > 2 yr    → green   (adequate)
+const _ISL_YEAR_DAYS = 365.25;
+
+function _islCompute(expiryDate, postingDate) {
   // BUG-ISL-2 FIX: cleaned up duplicate grey branch; distinct cases handled:
-  //   • no prodDate                 → grey (cannot calculate total shelf life)
-  //   • no expiryDate               → grey (cannot calculate remaining SL)
-  //   • no postingDate              → grey (no receipt event date to anchor from)
-  if (!prodDate || !expiryDate || !postingDate) {
-    return { totalSL: null, remainingSL: null, ratio: null, flag: "grey" };
+  //   • no expiryDate  → grey (cannot calculate anything)
+  //   • no postingDate → grey for SL-at-receipt only (no receipt event date)
+  if (!expiryDate) {
+    return {
+      slAtReceiptDays: null, receiptFlag: "grey",
+      remainingSLDays: null, ratio: null, flag: "grey", isExpired: false,
+      dataError: false,
+    };
   }
+
   const MS_PER_DAY = 86400000;
-  const totalSL     = Math.round((expiryDate - prodDate)  / MS_PER_DAY); // days
-  const remainingSL = Math.round((expiryDate - postingDate) / MS_PER_DAY); // days
-  if (totalSL <= 0) return { totalSL, remainingSL, ratio: 0, flag: "red" };
-  const ratio = remainingSL / totalSL;
+  const today = new Date();
+  const todayMidnight = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+
+  // ── SL Remaining (Today): Expiry Date − Today ──────────────────────────
+  const remainingSLDays = Math.round((expiryDate - todayMidnight) / MS_PER_DAY);
+  const isExpired = remainingSLDays < 0;
+
   let flag;
-  if (ratio > 0.90)       flag = "green";
-  else if (ratio >= 0.80) flag = "yellow";
-  else                    flag = "red";
-  return { totalSL, remainingSL, ratio, flag };
+  if (isExpired) {
+    flag = "expired"; // ISSUE-3 FIX: explicit expired state, not a 0% red bar
+  } else {
+    // Ratio of remaining SL to a 2-year (730-day) reference window, used only
+    // for the progress bar fill so the "today" view also has a visual scale.
+    const refWindow = _ISL_YEAR_DAYS * 2;
+    const r = remainingSLDays / refWindow;
+    flag = r > 0.5 ? "green" : r >= 0.375 ? "yellow" : "red"; // >1yr / 9mo-1yr / <9mo left
+  }
+  const ratio = isExpired ? null : Math.max(0, Math.min(1, remainingSLDays / (_ISL_YEAR_DAYS * 2)));
+
+  // ── SL at Receipt: Expiry Date − Posting Date ──────────────────────────
+  let slAtReceiptDays = null;
+  let receiptFlag = "grey";
+  let dataError = false;
+  if (postingDate) {
+    slAtReceiptDays = Math.round((expiryDate - postingDate) / MS_PER_DAY);
+    if (slAtReceiptDays <= 0) {
+      // ISSUE-4 FIX: production/posting date after expiry is a SAP data
+      // quality issue — flag separately, don't silently fold into "red".
+      dataError = true;
+      receiptFlag = "data_error";
+    } else {
+      const years = slAtReceiptDays / _ISL_YEAR_DAYS;
+      if (years < 1.5)      receiptFlag = "red";
+      else if (years <= 2)  receiptFlag = "yellow";
+      else                  receiptFlag = "green";
+    }
+  }
+
+  return { slAtReceiptDays, receiptFlag, remainingSLDays, ratio, flag, isExpired, dataError };
 }
 
 function _islPopulateFilters() {
@@ -2496,20 +2591,34 @@ function _islFmtPct(ratio) {
 }
 
 function _islFlagLabel(flag) {
-  if (flag === "green")  return `<span class="isl-flag-green">🟢 Green</span>`;
-  if (flag === "yellow") return `<span class="isl-flag-yellow">🟡 Yellow</span>`;
-  if (flag === "red")    return `<span class="isl-flag-red">🔴 Red</span>`;
-  return `<span class="isl-flag-grey">⚪ No Prod Date</span>`;
+  if (flag === "green")      return `<span class="isl-flag-green">🟢 Green</span>`;
+  if (flag === "yellow")     return `<span class="isl-flag-yellow">🟡 Yellow</span>`;
+  if (flag === "red")        return `<span class="isl-flag-red">🔴 Red</span>`;
+  if (flag === "expired")    return `<span class="isl-flag-red">⛔ EXPIRED</span>`;
+  if (flag === "data_error") return `<span style="background:#a371f7;color:#fff;padding:1px 6px;border-radius:4px;font-weight:700;font-size:0.72rem">⚠ Data Error</span>`;
+  return `<span class="isl-flag-grey">⚪ No Expiry Date</span>`;
 }
 
 function _islBarHtml(ratio, flag) {
-  if (ratio === null) return `<span class="isl-flag-grey" style="font-size:0.72rem">No Prod Date</span>`;
+  // ISSUE-3 FIX: explicit EXPIRED state instead of a misleading 0% bar
+  if (flag === "expired") return `<span class="isl-flag-red" style="font-size:0.72rem">⛔ EXPIRED</span>`;
+  if (ratio === null) return `<span class="isl-flag-grey" style="font-size:0.72rem">No Expiry Date</span>`;
   const pct = Math.max(0, Math.min(100, ratio * 100)).toFixed(1);
   const color = flag === "green" ? "#3fb950" : flag === "yellow" ? "#d29922" : "#f85149";
   return `<div class="isl-bar-wrap">
     <div class="isl-bar-bg"><div class="isl-bar-fill" style="width:${pct}%;background:${color}"></div></div>
     <span style="font-size:0.72rem;color:${color};min-width:42px">${pct}%</span>
   </div>`;
+}
+
+// ISSUE-1: separate small badge for "SL at Receipt" classification
+// (< 1.5yr red, 1.5-2yr yellow, > 2yr green; data_error if posting after expiry)
+function _islReceiptFlagLabel(flag) {
+  if (flag === "green")      return `<span class="isl-flag-green">🟢 &gt;2yr</span>`;
+  if (flag === "yellow")     return `<span class="isl-flag-yellow">🟡 1.5-2yr</span>`;
+  if (flag === "red")        return `<span class="isl-flag-red">🔴 &lt;1.5yr</span>`;
+  if (flag === "data_error") return `<span style="background:#a371f7;color:#fff;padding:1px 6px;border-radius:4px;font-weight:700;font-size:0.72rem">⚠ Data Error</span>`;
+  return `<span class="isl-flag-grey">—</span>`;
 }
 
 function renderIncomingShelfLife() {
@@ -2524,40 +2633,52 @@ function renderIncomingShelfLife() {
   const rows = _islGetFiltered();
 
   // KPIs
-  const total   = rows.length;
-  const green   = rows.filter(r => r._flag === "green").length;
-  const yellow  = rows.filter(r => r._flag === "yellow").length;
-  const red     = rows.filter(r => r._flag === "red").length;
-  const grey    = rows.filter(r => r._flag === "grey").length;
+  const total      = rows.length;
+  const green      = rows.filter(r => r._flag === "green").length;
+  const yellow     = rows.filter(r => r._flag === "yellow").length;
+  const red        = rows.filter(r => r._flag === "red").length;
+  const expired    = rows.filter(r => r._flag === "expired").length;
+  const grey       = rows.filter(r => r._flag === "grey").length;
+  const dataErrors = rows.filter(r => r._dataError).length;
 
   const totalMatched  = incomingRaw.length;
   const totalReceived = _incomingRawAll.length;
   const matchNote = totalReceived > totalMatched
-    ? `${totalMatched.toLocaleString()} / ${totalReceived.toLocaleString()} matched`
-    : `${totalMatched.toLocaleString()} records`;
+    ? `${totalMatched.toLocaleString()} batches / ${totalReceived.toLocaleString()} receipts`
+    : `${totalMatched.toLocaleString()} batches`;
 
   setKpis("isl-kpis", [
-    kpiCard("Matched Records",  total.toLocaleString(), `HO01 · ZME/ZMS/ZLC · ${matchNote}`, "var(--blue)"),
-    kpiCard("🟢 Green (>90%)",  green.toLocaleString(), "Adequate shelf life", "var(--green)"),
-    kpiCard("🟡 Yellow (80-90%)", yellow.toLocaleString(), "Watch closely", "var(--amber)"),
-    kpiCard("🔴 Red (≤80%)",    red.toLocaleString(), "Below threshold", "var(--red)"),
-    kpiCard("⚪ No Prod Date",  grey.toLocaleString(), "Cannot calculate", "var(--muted)"),
+    ["Matched Batches", total.toLocaleString(), `HO01 · ZME/ZMS/ZLC · ${matchNote}`, "blue"],
+    ["🟢 Green (>1yr left)",  green.toLocaleString(), "Adequate shelf life remaining", "green"],
+    ["🟡 Yellow (9mo-1yr)", yellow.toLocaleString(), "Watch closely", "amber"],
+    ["🔴 Red (<9mo left)",    red.toLocaleString(), "Distribute urgently", "red"],
+    ["⛔ Expired",       expired.toLocaleString(), "Past expiry date", "red"],
+    ["⚠ Data Errors",    dataErrors.toLocaleString(), "Posting date after expiry (SAP)", "purple"],
+    ["⚪ No Expiry Date", grey.toLocaleString(), "Cannot calculate", "muted"],
   ]);
 
-  // Chart: stacked bar per Storage Location
-  const slocMap = {};
+  // ISSUE-6 FIX: chart shows Flag distribution by current INVENTORY PLANT
+  // (where the batch is actually held now), not the HO01 receiving sloc —
+  // this is what tells branches which at-risk batches they're holding.
+  const plantMap = {};
   rows.forEach(r => {
-    const sl = String(r["Storage Location"] || "").trim() || "(Blank)";
-    if (!slocMap[sl]) slocMap[sl] = { green:0, yellow:0, red:0, grey:0 };
-    slocMap[sl][r._flag]++;
+    const plantsStr = (r._inv_plants && r._inv_plants !== "—") ? r._inv_plants : "(Unmatched)";
+    plantsStr.split(" · ").forEach(p => {
+      const plant = p.trim() || "(Unmatched)";
+      if (!plantMap[plant]) plantMap[plant] = { green:0, yellow:0, red:0, expired:0, grey:0, data_error:0 };
+      const bucket = plantMap[plant][r._flag] !== undefined ? r._flag : (r._dataError ? "data_error" : "grey");
+      plantMap[plant][bucket]++;
+    });
   });
-  const slocs = Object.keys(slocMap).sort();
+  const plants = Object.keys(plantMap).sort();
   Plotly.newPlot("isl-chart-sloc", [
-    { name:"🟢 Green",        x: slocs, y: slocs.map(s => slocMap[s].green),  type:"bar", marker:{ color:"#3fb950" } },
-    { name:"🟡 Yellow",       x: slocs, y: slocs.map(s => slocMap[s].yellow), type:"bar", marker:{ color:"#d29922" } },
-    { name:"🔴 Red",          x: slocs, y: slocs.map(s => slocMap[s].red),    type:"bar", marker:{ color:"#f85149" } },
-    { name:"⚪ No Prod Date", x: slocs, y: slocs.map(s => slocMap[s].grey),   type:"bar", marker:{ color:"#6e7681" } },
-  ], { ...pl(), barmode:"stack", height:280 }, PLOTLY_CONFIG);
+    { name:"🟢 Green",   x: plants, y: plants.map(p => plantMap[p].green),      type:"bar", marker:{ color:"#3fb950" } },
+    { name:"🟡 Yellow",  x: plants, y: plants.map(p => plantMap[p].yellow),     type:"bar", marker:{ color:"#d29922" } },
+    { name:"🔴 Red",     x: plants, y: plants.map(p => plantMap[p].red),        type:"bar", marker:{ color:"#f85149" } },
+    { name:"⛔ Expired", x: plants, y: plants.map(p => plantMap[p].expired),    type:"bar", marker:{ color:"#7f1d1d" } },
+    { name:"⚠ Data Error", x: plants, y: plants.map(p => plantMap[p].data_error), type:"bar", marker:{ color:"#a371f7" } },
+    { name:"⚪ No Expiry", x: plants, y: plants.map(p => plantMap[p].grey),     type:"bar", marker:{ color:"#6e7681" } },
+  ], { ...pl(), barmode:"stack", height:280, title:"Flag Distribution by Current Inventory Plant" }, PLOTLY_CONFIG);
 
   // Count info
   const countEl = document.getElementById("isl-count");
@@ -2565,28 +2686,36 @@ function renderIncomingShelfLife() {
   countEl.textContent = `Showing ${rows.length.toLocaleString()} record${rows.length !== 1 ? "s" : ""}`;
 
   // BUG-ISL-6 FIX: table columns reflect correct data sources —
-  //   • Production Date & Expiry Date  → from inventory (SAP master via _inv_*)
-  //   • Posting Date & Document Number → from received goods data
+  //   • Expiry Date → from inventory (SAP master via _inv_*)
+  //   • Posting Date & Document Number → from received goods data (latest receipt = reference)
   //   • Plants in Inventory / Inventory Slocs → enriched from rawDf all branches
+  // ISSUE-1: two SL columns (SL at Receipt vs SL Remaining Today)
+  // ISSUE-2: grouped quantity / receipt count columns
   const COLS = [
     { key:"Material",             label:"Material Code" },
     { key:"Material Description", label:"Material Description" },
     { key:"Batch",                label:"Batch" },
     { key:"_vt",                  label:"Val. Type" },
-    // ── From received goods data (HO01 receipt event) ──
+    // ── From received goods data (HO01 receipt event, latest of group) ──
     { key:"Storage Location",     label:"HO01 Receipt Sloc",
       fmt: v => v ? escHtml(String(v)) : "—", raw: true },
-    { key:"_postingDate",         label:"Posting Date (Receipt)",
+    { key:"_postingDate",         label:"Latest Posting Date",
       fmt: v => v ? fmtLocalDate(v) : "—" },
-    { key:"Material Document",    label:"GR Document No.",
+    { key:"_groupedQty",          label:"Total Qty Received",
+      fmt: v => fmtQty(v) },
+    { key:"_receiptCount",        label:"# GR Postings",
+      fmt: v => v ? v.toLocaleString() : "1" },
+    { key:"Material Document",    label:"GR Document No. (latest)",
       fmt: v => v ? escHtml(String(v)) : "—", raw: true },
     // ── From inventory (authoritative SAP master) ──
-    { key:"_inv_prodDate",        label:"Production Date (Inv)",
-      fmt: v => v instanceof Date ? fmtLocalDate(v) : (v ? String(v) : "—") },
     { key:"_inv_expiryDate",      label:"Expiry Date (Inv)",
       fmt: v => v instanceof Date ? fmtLocalDate(v) : (v ? String(v) : "—") },
-    { key:"_totalSL",             label:"Total SL (days)",      fmt: v => _islFmtDays(v) },
-    { key:"_remainingSL",         label:"Remaining SL (days)",  fmt: v => _islFmtDays(v) },
+    // SL at Receipt: Expiry − Posting Date (supplier compliance)
+    { key:"_slAtReceiptDays",     label:"SL at Receipt (days)",  fmt: v => _islFmtDays(v) },
+    { key:"_receiptFlag",         label:"SL at Receipt Flag",
+      fmt: v => _islReceiptFlagLabel(v), raw: true },
+    // SL Remaining Today: Expiry − Today (distribution urgency)
+    { key:"_remainingSL",         label:"SL Remaining Today (days)",  fmt: v => _islFmtDays(v) },
     { key:"_ratio",               label:"SL Remaining %",
       fmt: (v, r) => _islBarHtml(v, r._flag), raw: true },
     { key:"_flag",                label:"Flag",
@@ -2624,20 +2753,24 @@ function renderIncomingShelfLife() {
 
   // ── Download helpers ────────────────────────────────────────────────────────
   // Flatten a row for export: strip HTML from raw columns, format dates/ratios
+  const FLAG_LABEL = { green:"Green (>1yr left)", yellow:"Yellow (9mo-1yr)", red:"Red (<9mo left)", expired:"EXPIRED", grey:"No Expiry Date" };
+  const RECEIPT_FLAG_LABEL = { green:">2yr", yellow:"1.5-2yr", red:"<1.5yr", data_error:"Data Error (posting after expiry)", grey:"—" };
+
   function _islFlatRow(r) {
-    const FLAG_LABEL = { green:"Green >90%", yellow:"Yellow 80-90%", red:"Red ≤80%", grey:"No Prod Date" };
     return {
       "Material Code":            r["Material"]          || "",
       "Material Description":     r["Material Description"] || "",
       "Batch":                    r["Batch"]             || "",
       "Val. Type":                r._vt                  || "",
       "HO01 Receipt Sloc":        String(r["Storage Location"] || ""),
-      "Posting Date (Receipt)":   r._postingDate ? fmtLocalDate(r._postingDate) : "",
-      "GR Document No.":          String(r["Material Document"] || r["GR Document"] || ""),
-      "Production Date (Inv)":    r._inv_prodDate   instanceof Date ? fmtLocalDate(r._inv_prodDate)   : (r._inv_prodDate   ? String(r._inv_prodDate)   : ""),
+      "Latest Posting Date":      r._postingDate ? fmtLocalDate(r._postingDate) : "",
+      "Total Qty Received":       r._groupedQty   !== undefined ? r._groupedQty   : "",
+      "# GR Postings":            r._receiptCount !== undefined ? r._receiptCount : 1,
+      "GR Document No. (latest)": String(r["Material Document"] || r["GR Document"] || ""),
       "Expiry Date (Inv)":        r._inv_expiryDate instanceof Date ? fmtLocalDate(r._inv_expiryDate) : (r._inv_expiryDate ? String(r._inv_expiryDate) : ""),
-      "Total SL (days)":          r._totalSL     !== null && r._totalSL     !== undefined ? r._totalSL     : "",
-      "Remaining SL (days)":      r._remainingSL !== null && r._remainingSL !== undefined ? r._remainingSL : "",
+      "SL at Receipt (days)":     r._slAtReceiptDays !== null && r._slAtReceiptDays !== undefined ? r._slAtReceiptDays : "",
+      "SL at Receipt Flag":       RECEIPT_FLAG_LABEL[r._receiptFlag] || r._receiptFlag || "",
+      "SL Remaining Today (days)": r._remainingSL !== null && r._remainingSL !== undefined ? r._remainingSL : "",
       "SL Remaining %":           r._ratio !== null && r._ratio !== undefined ? +((r._ratio*100).toFixed(2)) : "",
       "Flag":                     FLAG_LABEL[r._flag] || r._flag || "",
       "Plants in Inventory":      r._inv_plants  || "",
@@ -2645,7 +2778,17 @@ function renderIncomingShelfLife() {
       "Total Inv. Qty":           r._inv_totalQty !== undefined ? r._inv_totalQty : "",
     };
   }
-  const EXPORT_KEYS = Object.keys(_islFlatRow(rows[0] || {}));
+
+  // ISSUE-5 FIX: static export key list — doesn't depend on rows[0], so
+  // headers are always correct even when the filtered set is empty.
+  const EXPORT_KEYS = [
+    "Material Code","Material Description","Batch","Val. Type",
+    "HO01 Receipt Sloc","Latest Posting Date","Total Qty Received","# GR Postings",
+    "GR Document No. (latest)","Expiry Date (Inv)",
+    "SL at Receipt (days)","SL at Receipt Flag",
+    "SL Remaining Today (days)","SL Remaining %","Flag",
+    "Plants in Inventory","Inventory Slocs","Total Inv. Qty",
+  ];
   const exportColDefs = EXPORT_KEYS.map(k => ({ key: k, label: k }));
 
   document.getElementById("btn-dl-incoming-xlsx").onclick = () => {
