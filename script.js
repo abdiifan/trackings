@@ -110,7 +110,7 @@ let stFilterState      = { purDoc: "", supPlant: "" };  // filter state
 
 // Incoming Shelf Life — received goods file state
 let incomingRaw        = [];   // raw rows from received goods xlsx
-const islFilterState   = { date: "", valType: "", sloc: "", flag: "" };
+const islFilterState   = { date: "", valType: "", sloc: "", plant: "", flag: "" };
 
 // Page-level filter state — now arrays for multi-select support
 // NOTE: "preview" page uses its own <select multiple> UI (filtDf), not pageFilters.
@@ -2179,18 +2179,26 @@ function loadIncomingFile(file) {
           return ALLOWED_VT.includes(vt);
         });
 
-        // Parse dates
+        // Parse fields from received goods file.
+        // BUG-ISL-1 FIX: Production Date and Expiry Date are NOT parsed here —
+        // they come from inventory (SAP master) during _islCrossMatchInventory().
+        // Only Posting Date and Valuation Type are sourced from this file.
         rows.forEach(r => {
-          r._postingDate  = _islParseDate(r["Posting Date"]);
-          r._prodDate     = _islParseDate(r["Production Date"] || r["Mfg Date"] || r["Manufacturing Date"] || "");
-          r._expiryDate   = _islParseDate(r["Shelf Life Expiration Date"] || r["Expiry Date"] || r["Best Before Date"] || "");
-          r._vt           = _islExtractVT(r);
-          // Compute shelf life metrics
-          const { totalSL, remainingSL, ratio, flag } = _islCompute(r._prodDate, r._expiryDate, r._postingDate);
-          r._totalSL     = totalSL;
-          r._remainingSL = remainingSL;
-          r._ratio       = ratio;
-          r._flag        = flag;
+          r._postingDate = _islParseDate(r["Posting Date"]);
+          r._vt          = _islExtractVT(r);
+          // SL metrics will be computed in _islCrossMatchInventory once
+          // inventory dates are resolved; initialise to grey for safety
+          r._totalSL     = null;
+          r._remainingSL = null;
+          r._ratio       = null;
+          r._flag        = "grey";
+          // Inventory enrichment fields — populated by _islCrossMatchInventory
+          r._inv_plants   = "—";
+          r._inv_slocs    = "—";
+          r._inv_totalQty = 0;
+          r._inv_prodDate   = null;
+          r._inv_expiryDate = null;
+          r._inInventory    = null;
         });
 
         // Store all parsed HO01/ZME+ZMS+ZLC rows before cross-match
@@ -2316,24 +2324,37 @@ function _islExtractVT(row) {
 
 function _islParseDate(v) {
   if (!v) return null;
+  // Already a JS Date (cellDates:true path)
   if (v instanceof Date) return isNaN(v.getTime()) ? null : new Date(v.getFullYear(), v.getMonth(), v.getDate());
   const s = String(v).trim();
   if (!s) return null;
-  // Try numeric serial (Excel)
+  // yyyy-mm-dd string — treat as local midnight (BUG-ISL-3 / BUG-8 consistent)
+  const isoMatch = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (isoMatch) {
+    const dt = new Date(+isoMatch[1], +isoMatch[2] - 1, +isoMatch[3]);
+    return isNaN(dt.getTime()) ? null : dt;
+  }
+  // BUG-ISL-3 FIX: SAP Excel serial dates use the Lotus 1900 leap-year bug
+  // offset, so the correct formula is n - 2 (not n - 1).
+  // XLSX.js with cellDates:true should have already converted these, but guard
+  // against raw numeric values that bypass that path.
   const n = Number(s);
-  if (!isNaN(n) && n > 1000) {
-    const d = new Date(Date.UTC(1900, 0, n - 1));
+  if (!isNaN(n) && n > 1000 && n < 2958466) {  // 2958466 = 31-Dec-9999
+    const d = new Date(Date.UTC(1900, 0, n - 2));
     return new Date(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
   }
+  // Generic fallback
   const d = new Date(s);
   if (!isNaN(d.getTime())) return new Date(d.getFullYear(), d.getMonth(), d.getDate());
   return null;
 }
 
 function _islCompute(prodDate, expiryDate, postingDate) {
+  // BUG-ISL-2 FIX: cleaned up duplicate grey branch; distinct cases handled:
+  //   • no prodDate                 → grey (cannot calculate total shelf life)
+  //   • no expiryDate               → grey (cannot calculate remaining SL)
+  //   • no postingDate              → grey (no receipt event date to anchor from)
   if (!prodDate || !expiryDate || !postingDate) {
-    // No production date — show grey
-    if (!prodDate) return { totalSL: null, remainingSL: null, ratio: null, flag: "grey" };
     return { totalSL: null, remainingSL: null, ratio: null, flag: "grey" };
   }
   const MS_PER_DAY = 86400000;
@@ -2349,40 +2370,64 @@ function _islCompute(prodDate, expiryDate, postingDate) {
 }
 
 function _islPopulateFilters() {
+  // BUG-ISL-5 FIX: use fmtLocalDate() (local date parts) not toISOString()
+  // which shifts UTC midnight dates by one day in UTC+3 (Ethiopia).
+
   // Posting dates — sorted descending (most recent first)
   const dates = [...new Set(
     incomingRaw
       .map(r => r._postingDate)
       .filter(d => d instanceof Date)
-      .map(d => d.toISOString().slice(0,10))
+      .map(d => fmtLocalDate(d))
   )].sort().reverse();
 
   const dateEl = document.getElementById("isl-filter-date");
   if (dateEl) {
     dateEl.innerHTML = `<option value="">All Posting Dates</option>` +
-      dates.map(d => `<option value="${d}">${d}</option>`).join("");
+      dates.map(d => `<option value="${escHtml(d)}">${escHtml(d)}</option>`).join("");
   }
 
-  // Storage locations
+  // Storage locations from received data (HO01 receiving sloc)
   const slocs = [...new Set(incomingRaw.map(r => String(r["Storage Location"] || "").trim()).filter(Boolean))].sort();
   const slocEl = document.getElementById("isl-filter-sloc");
   if (slocEl) {
     slocEl.innerHTML = `<option value="">All Storage Locations</option>` +
-      slocs.map(s => `<option value="${s}">${escHtml(s)}</option>`).join("");
+      slocs.map(s => `<option value="${escHtml(s)}">${escHtml(s)}</option>`).join("");
+  }
+
+  // BUG-ISL-4 FIX: plant filter — populated from inventory match (_inv_plants)
+  // so user can filter to see which received batches are currently at a branch
+  const plantSet = new Set();
+  incomingRaw.forEach(r => {
+    if (r._inv_plants && r._inv_plants !== "—") {
+      r._inv_plants.split(" · ").forEach(p => { if (p) plantSet.add(p.trim()); });
+    }
+  });
+  const plants = [...plantSet].sort();
+  const plantEl = document.getElementById("isl-filter-plant");
+  if (plantEl) {
+    plantEl.innerHTML = `<option value="">All Plants</option>` +
+      plants.map(p => `<option value="${escHtml(p)}">${escHtml(p)}</option>`).join("");
   }
 }
 
 function _islGetFiltered() {
-  const { date, valType, sloc, flag } = islFilterState;
+  const { date, valType, sloc, plant, flag } = islFilterState;
   return incomingRaw.filter(r => {
+    // BUG-ISL-5 FIX: compare using local date string (not toISOString)
     if (date) {
-      const rd = r._postingDate ? r._postingDate.toISOString().slice(0,10) : "";
+      const rd = r._postingDate ? fmtLocalDate(r._postingDate) : "";
       if (rd !== date) return false;
     }
     if (valType && r._vt !== valType) return false;
     if (sloc) {
       const rs = String(r["Storage Location"] || "").trim();
       if (rs !== sloc) return false;
+    }
+    // BUG-ISL-4 FIX: plant filter — check if any _inv_plants entry matches
+    if (plant) {
+      const rp = r._inv_plants || "";
+      if (!rp.split(" · ").some(p => p.trim() === plant)) return false;
     }
     if (flag && r._flag !== flag) return false;
     return true;
@@ -2434,12 +2479,14 @@ function renderIncomingShelfLife() {
   const red     = rows.filter(r => r._flag === "red").length;
   const grey    = rows.filter(r => r._flag === "grey").length;
 
-  const matchedOf = _incomingRawAll.length > incomingRaw.length
-    ? ` (${incomingRaw.length.toLocaleString()} / ${_incomingRawAll.length.toLocaleString()} matched)`
-    : "";
+  const totalMatched  = incomingRaw.length;
+  const totalReceived = _incomingRawAll.length;
+  const matchNote = totalReceived > totalMatched
+    ? `${totalMatched.toLocaleString()} / ${totalReceived.toLocaleString()} matched`
+    : `${totalMatched.toLocaleString()} records`;
 
   setKpis("isl-kpis", [
-    kpiCard("Total Records",    total.toLocaleString(), `HO01 · ZME/ZMS/ZLC${matchedOf}`, "var(--blue)"),
+    kpiCard("Matched Records",  total.toLocaleString(), `HO01 · ZME/ZMS/ZLC · ${matchNote}`, "var(--blue)"),
     kpiCard("🟢 Green (>90%)",  green.toLocaleString(), "Adequate shelf life", "var(--green)"),
     kpiCard("🟡 Yellow (80-90%)", yellow.toLocaleString(), "Watch closely", "var(--amber)"),
     kpiCard("🔴 Red (≤80%)",    red.toLocaleString(), "Below threshold", "var(--red)"),
@@ -2466,20 +2513,40 @@ function renderIncomingShelfLife() {
   countEl.style.display = "block";
   countEl.textContent = `Showing ${rows.length.toLocaleString()} record${rows.length !== 1 ? "s" : ""}`;
 
-  // Table
+  // BUG-ISL-6 FIX: table columns reflect correct data sources —
+  //   • Production Date & Expiry Date  → from inventory (SAP master via _inv_*)
+  //   • Posting Date & Document Number → from received goods data
+  //   • Plants in Inventory / Inventory Slocs → enriched from rawDf all branches
   const COLS = [
-    { key:"Material",                label:"Material Code" },
-    { key:"Material Description",    label:"Material Description" },
-    { key:"Batch",                   label:"Batch" },
-    { key:"_vt",                     label:"Val. Type" },
-    { key:"Storage Location",        label:"Storage Location" },
-    { key:"_postingDate",            label:"Receipt Date",      fmt: v => v ? fmtLocalDate(v) : "—" },
-    { key:"Production Date",         label:"Production Date",   fmt: v => v ? (v instanceof Date ? fmtLocalDate(v) : v) : "—" },
-    { key:"Shelf Life Expiration Date", label:"Expiry Date",    fmt: v => v ? (v instanceof Date ? fmtLocalDate(v) : v) : "—" },
-    { key:"_totalSL",                label:"Total SL (days)",   fmt: v => _islFmtDays(v) },
-    { key:"_remainingSL",            label:"Remaining SL (days)", fmt: v => _islFmtDays(v) },
-    { key:"_ratio",                  label:"SL Remaining %",    fmt: (v, r) => _islBarHtml(v, r._flag), raw: true },
-    { key:"_flag",                   label:"Flag",              fmt: v => _islFlagLabel(v), raw: true },
+    { key:"Material",             label:"Material Code" },
+    { key:"Material Description", label:"Material Description" },
+    { key:"Batch",                label:"Batch" },
+    { key:"_vt",                  label:"Val. Type" },
+    // ── From received goods data (HO01 receipt event) ──
+    { key:"Storage Location",     label:"HO01 Receipt Sloc",
+      fmt: v => v ? escHtml(String(v)) : "—", raw: true },
+    { key:"_postingDate",         label:"Posting Date (Receipt)",
+      fmt: v => v ? fmtLocalDate(v) : "—" },
+    { key:"Material Document",    label:"GR Document No.",
+      fmt: v => v ? escHtml(String(v)) : "—", raw: true },
+    // ── From inventory (authoritative SAP master) ──
+    { key:"_inv_prodDate",        label:"Production Date (Inv)",
+      fmt: v => v instanceof Date ? fmtLocalDate(v) : (v ? String(v) : "—") },
+    { key:"_inv_expiryDate",      label:"Expiry Date (Inv)",
+      fmt: v => v instanceof Date ? fmtLocalDate(v) : (v ? String(v) : "—") },
+    { key:"_totalSL",             label:"Total SL (days)",      fmt: v => _islFmtDays(v) },
+    { key:"_remainingSL",         label:"Remaining SL (days)",  fmt: v => _islFmtDays(v) },
+    { key:"_ratio",               label:"SL Remaining %",
+      fmt: (v, r) => _islBarHtml(v, r._flag), raw: true },
+    { key:"_flag",                label:"Flag",
+      fmt: v => _islFlagLabel(v), raw: true },
+    // ── Current inventory distribution (all branches) ──
+    { key:"_inv_plants",          label:"Plants in Inventory",
+      fmt: v => v ? `<span style="font-size:0.75rem">${escHtml(String(v))}</span>` : "—", raw: true },
+    { key:"_inv_slocs",           label:"Inventory Slocs",
+      fmt: v => v ? `<span style="font-size:0.72rem;color:var(--muted)">${escHtml(String(v))}</span>` : "—", raw: true },
+    { key:"_inv_totalQty",        label:"Total Inv. Qty",
+      fmt: v => (v !== undefined && v !== null) ? fmtQty(v) : "—" },
   ];
 
   const wrap = document.getElementById("isl-table-wrap");
@@ -2504,40 +2571,39 @@ function renderIncomingShelfLife() {
   if (rows.length > LIMIT) html += `<div class="alert-info" style="margin-top:0.5rem">Showing first ${LIMIT.toLocaleString()} of ${rows.length.toLocaleString()} records. Download Excel/CSV for full data.</div>`;
   wrap.innerHTML = html;
 
-  // Download buttons
+  // ── Download helpers ────────────────────────────────────────────────────────
+  // Flatten a row for export: strip HTML from raw columns, format dates/ratios
+  function _islFlatRow(r) {
+    const FLAG_LABEL = { green:"Green >90%", yellow:"Yellow 80-90%", red:"Red ≤80%", grey:"No Prod Date" };
+    return {
+      "Material Code":            r["Material"]          || "",
+      "Material Description":     r["Material Description"] || "",
+      "Batch":                    r["Batch"]             || "",
+      "Val. Type":                r._vt                  || "",
+      "HO01 Receipt Sloc":        String(r["Storage Location"] || ""),
+      "Posting Date (Receipt)":   r._postingDate ? fmtLocalDate(r._postingDate) : "",
+      "GR Document No.":          String(r["Material Document"] || r["GR Document"] || ""),
+      "Production Date (Inv)":    r._inv_prodDate   instanceof Date ? fmtLocalDate(r._inv_prodDate)   : (r._inv_prodDate   ? String(r._inv_prodDate)   : ""),
+      "Expiry Date (Inv)":        r._inv_expiryDate instanceof Date ? fmtLocalDate(r._inv_expiryDate) : (r._inv_expiryDate ? String(r._inv_expiryDate) : ""),
+      "Total SL (days)":          r._totalSL     !== null && r._totalSL     !== undefined ? r._totalSL     : "",
+      "Remaining SL (days)":      r._remainingSL !== null && r._remainingSL !== undefined ? r._remainingSL : "",
+      "SL Remaining %":           r._ratio !== null && r._ratio !== undefined ? +((r._ratio*100).toFixed(2)) : "",
+      "Flag":                     FLAG_LABEL[r._flag] || r._flag || "",
+      "Plants in Inventory":      r._inv_plants  || "",
+      "Inventory Slocs":          r._inv_slocs   || "",
+      "Total Inv. Qty":           r._inv_totalQty !== undefined ? r._inv_totalQty : "",
+    };
+  }
+  const EXPORT_KEYS = Object.keys(_islFlatRow(rows[0] || {}));
+  const exportColDefs = EXPORT_KEYS.map(k => ({ key: k, label: k }));
+
   document.getElementById("btn-dl-incoming-xlsx").onclick = () => {
-    const exportCols = COLS.filter(c => !c.raw || c.key === "_flag").map(c => ({
-      key: c.key, label: c.label,
-      fmt: c.key === "_flag" ? (v => ({ green:"Green >90%", yellow:"Yellow 80-90%", red:"Red ≤80%", grey:"No Prod Date" }[v] || v)) :
-           c.key === "_ratio" ? (v => v !== null && v !== undefined ? +(v*100).toFixed(2) : null) :
-           c.key === "_postingDate" ? (v => v ? fmtLocalDate(v) : "") :
-           c.fmt || null
-    }));
-    const flat = rows.map(r => {
-      const o = {};
-      exportCols.forEach(c => {
-        const raw = r[c.key] ?? "";
-        o[c.label] = c.fmt ? c.fmt(raw, r) : raw;
-      });
-      return o;
-    });
-    downloadExcel(flat, exportCols.map(c=>({key:c.label,label:c.label})), "incoming_shelf_life.xlsx");
+    const flat = rows.map(_islFlatRow);
+    downloadExcel(flat, exportColDefs, "incoming_shelf_life.xlsx");
   };
   document.getElementById("btn-dl-incoming-csv").onclick = () => {
-    const exportCols = COLS.filter(c => !c.raw || c.key === "_flag");
-    const flat = rows.map(r => {
-      const o = {};
-      exportCols.forEach(c => {
-        let val = r[c.key] ?? "";
-        if (c.key === "_flag") val = { green:"Green >90%", yellow:"Yellow 80-90%", red:"Red ≤80%", grey:"No Prod Date" }[val] || val;
-        else if (c.key === "_ratio") val = val !== null && val !== undefined ? (val*100).toFixed(2)+"%" : "";
-        else if (c.key === "_postingDate") val = val ? fmtLocalDate(val) : "";
-        else if (c.fmt && !c.raw) val = c.fmt(val, r);
-        o[c.label] = val;
-      });
-      return o;
-    });
-    downloadCSV(flat, exportCols.map(c=>({key:c.label,label:c.label})), "incoming_shelf_life.csv");
+    const flat = rows.map(_islFlatRow);
+    downloadCSV(flat, exportColDefs, "incoming_shelf_life.csv");
   };
 }
 
@@ -2622,12 +2688,13 @@ document.addEventListener("DOMContentLoaded", () => {
     islFilterState.date    = (document.getElementById("isl-filter-date")    || {}).value || "";
     islFilterState.valType = (document.getElementById("isl-filter-valtype") || {}).value || "";
     islFilterState.sloc    = (document.getElementById("isl-filter-sloc")    || {}).value || "";
+    islFilterState.plant   = (document.getElementById("isl-filter-plant")   || {}).value || "";
     islFilterState.flag    = (document.getElementById("isl-filter-flag")    || {}).value || "";
     renderIncomingShelfLife();
   });
   document.getElementById("isl-filter-clear").addEventListener("click", () => {
-    islFilterState.date = islFilterState.valType = islFilterState.sloc = islFilterState.flag = "";
-    ["isl-filter-date","isl-filter-valtype","isl-filter-sloc","isl-filter-flag"].forEach(id => {
+    islFilterState.date = islFilterState.valType = islFilterState.sloc = islFilterState.plant = islFilterState.flag = "";
+    ["isl-filter-date","isl-filter-valtype","isl-filter-sloc","isl-filter-plant","isl-filter-flag"].forEach(id => {
       const el = document.getElementById(id); if (el) el.value = "";
     });
     renderIncomingShelfLife();
