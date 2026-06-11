@@ -541,10 +541,11 @@
           <label class="isl-filter-label">Flag</label>
           <select id="isl-filter-flag" style="background:var(--surface2);border:1px solid var(--border2);color:var(--text);padding:6px 10px;border-radius:6px;font-size:13px;min-width:130px">
             <option value="">All Flags</option>
-            <option value="green">🟢 Green</option>
-            <option value="yellow">🟡 Yellow</option>
-            <option value="red">🔴 Red</option>
-            <option value="grey">⚪ No Prod Date</option>
+            <option value="green">🟢 Green (&gt;1yr left)</option>
+            <option value="yellow">🟡 Yellow (9mo-1yr)</option>
+            <option value="red">🔴 Red (&lt;9mo left)</option>
+            <option value="expired">⛔ Expired</option>
+            <option value="grey">⚪ No Expiry Date</option>
           </select>
         </div>
         <button type="button" class="apply-btn small" id="isl-filter-apply">Apply</button>
