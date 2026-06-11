@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>EPSS Stock-Multiple— Inventory Management</title>
+  <title>EPSS Stock-Multiple — Inventory Management</title>
   <style>
     .brand-icon img { height: 44px; width: auto; display: block; }
     .landing-logo img { height: 90px; width: auto; display: block; margin: 0 auto 0.5rem; }
@@ -79,7 +79,7 @@
     </div>
   </div>
 
-  <div class="sidebar-footer">Stock-MultipleTrack· ETB Currency</div>
+  <div class="sidebar-footer">Stock-MultipleTrack · ETB Currency</div>
 </aside>
 
 <!-- Global search results panel (outside sidebar, rendered in main area) -->
@@ -554,9 +554,10 @@
           <label class="isl-filter-label">Flag</label>
           <select id="isl-filter-flag" style="background:var(--surface2);border:1px solid var(--border2);color:var(--text);padding:6px 10px;border-radius:6px;font-size:13px;min-width:130px">
             <option value="">All Flags</option>
-            <option value="green">🟢 Green (&gt;1yr left)</option>
-            <option value="yellow">🟡 Yellow (9mo-1yr)</option>
-            <option value="red">🔴 Red (&lt;9mo left)</option>
+            <!-- BUG-FIX-10: labels now match receipt-flag thresholds (legend lines above) -->
+            <option value="green">🟢 Green (&gt;2yr at receipt)</option>
+            <option value="yellow">🟡 Yellow (1.5–2yr at receipt)</option>
+            <option value="red">🔴 Red (&lt;1.5yr at receipt)</option>
             <option value="expired">⛔ Expired</option>
           </select>
         </div>
