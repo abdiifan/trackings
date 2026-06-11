@@ -2261,30 +2261,88 @@ let _incomingRawAll = [];   // full parsed HO01 list, unfiltered by inventory
  * Also stamps r._inInventory = true/false on every row in _incomingRawAll
  * so callers can optionally inspect what was dropped.
  */
+function _islBuildInvMap() {
+  // Returns Map: "MATERIAL||BATCH" -> array of all rawDf rows for that batch
+  const map = new Map();
+  rawDf.forEach(r => {
+    const mat   = String(r["Material"] || "").trim().toUpperCase();
+    const batch = String(r["Batch"]    || "").trim().toUpperCase();
+    if (!mat || !batch) return;
+    const key = mat + "||" + batch;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(r);
+  });
+  return map;
+}
+
 function _islCrossMatchInventory() {
   if (!rawDf.length) {
-    // Inventory not yet loaded — show everything, mark unknown
+    // Inventory not yet loaded — pass through all, mark unknown
     _incomingRawAll.forEach(r => { r._inInventory = null; });
     incomingRaw = _incomingRawAll.slice();
     return;
   }
 
-  // Build lookup key set from inventory (all branches)
-  const invKeys = new Set();
-  rawDf.forEach(r => {
-    const mat   = String(r["Material"] || "").trim().toUpperCase();
-    const batch = String(r["Batch"]    || "").trim().toUpperCase();
-    if (mat && batch) invKeys.add(`${mat}||${batch}`);
-  });
+  const invMap = _islBuildInvMap();
 
-  // Stamp and filter
   _incomingRawAll.forEach(r => {
-    const mat   = String(r["Material"] || "").trim().toUpperCase();
-    const batch = String(r["Batch"]    || "").trim().toUpperCase();
-    r._inInventory = !!(mat && batch && invKeys.has(`${mat}||${batch}`));
+    const mat     = String(r["Material"] || "").trim().toUpperCase();
+    const batch   = String(r["Batch"]    || "").trim().toUpperCase();
+    const key     = mat + "||" + batch;
+    const invRows = invMap.get(key);
+
+    if (!invRows || !invRows.length) {
+      r._inInventory = false;
+      return;
+    }
+    r._inInventory = true;
+
+    // ── Plants currently holding this batch (all branches, deduplicated) ──
+    const plants = [...new Set(invRows.map(ir => {
+      const p  = String(ir["Plant"]      || "").trim();
+      const pn = String(ir["Plant Name"] || "").trim();
+      return p ? (pn ? p + " – " + pn : p) : "";
+    }))].filter(Boolean).sort();
+    r._inv_plants = plants.join(" · ") || "—";
+
+    // ── Plant / Storage Location pairs ──
+    const slocs = [...new Set(invRows.map(ir => {
+      const p  = String(ir["Plant"]                           || "").trim();
+      const sl = String(ir["Storage Location"]                || "").trim();
+      const sd = String(ir["Description of Storage Location"] || "").trim();
+      return sl ? (p + "/" + sl + (sd ? " (" + sd + ")" : "")) : "";
+    }))].filter(Boolean).sort();
+    r._inv_slocs = slocs.join(" · ") || "—";
+
+    // ── Total unrestricted qty across all inventory rows for this batch ──
+    r._inv_totalQty = invRows.reduce(function(s, ir) {
+      return s + (parseFloat(ir["Unrestricted Stock"]) || 0);
+    }, 0);
+
+    // ── Dates: authoritative source is inventory (SAP master) ──
+    // BUG-ISL-1 FIX: do NOT use dates from received goods file
+    function findInvDate(col) {
+      for (var i = 0; i < invRows.length; i++) {
+        var d = _islParseDate(invRows[i][col]);
+        if (d) return d;
+      }
+      return null;
+    }
+    r._inv_prodDate   = findInvDate("Production Date") ||
+                        findInvDate("Mfg Date")        ||
+                        findInvDate("Manufacturing Date");
+    r._inv_expiryDate = findInvDate("Shelf Life Expiration Date") ||
+                        findInvDate("Expiry Date");
+
+    // ── Recompute shelf life using inventory dates + received posting date ──
+    var sl = _islCompute(r._inv_prodDate, r._inv_expiryDate, r._postingDate);
+    r._totalSL     = sl.totalSL;
+    r._remainingSL = sl.remainingSL;
+    r._ratio       = sl.ratio;
+    r._flag        = sl.flag;
   });
 
-  incomingRaw = _incomingRawAll.filter(r => r._inInventory === true);
+  incomingRaw = _incomingRawAll.filter(function(r) { return r._inInventory === true; });
 }
 
 /**
@@ -2294,23 +2352,16 @@ function _islCrossMatchInventory() {
 function recomputeIslMatch() {
   if (!_incomingRawAll.length) return; // no received goods uploaded yet
   _islCrossMatchInventory();
-  if (currentPage === "incoming") renderIncomingShelfLife();
-  // Update the status line to reflect new match count
+  // Update sidebar status note
   const statusEl = document.getElementById("incomingFileStatus");
   if (statusEl && statusEl.style.display !== "none") {
-    const total   = _incomingRawAll.length;
-    const matched = incomingRaw.length;
-    const existing = statusEl.innerHTML;
-    // Replace the last status-name line (match note) or append it
-    if (existing.includes("matched in inventory") || existing.includes("Upload inventory")) {
-      statusEl.innerHTML = existing.replace(
-        / · [\d,]+ matched in inventory| · Upload inventory to cross-match/,
-        ` · ${matched.toLocaleString()} matched in inventory`
-      );
-    }
+    statusEl.innerHTML = statusEl.innerHTML.replace(
+      / · [\d,]+ matched in inventory| · Upload inventory to cross-match/,
+      " · " + incomingRaw.length.toLocaleString() + " matched in inventory"
+    );
   }
-  // Re-populate ISL filters since the dataset changed
-  if (_incomingRawAll.length) _islPopulateFilters();
+  _islPopulateFilters();
+  if (currentPage === "incoming") renderIncomingShelfLife();
 }
 
 function _islExtractVT(row) {
