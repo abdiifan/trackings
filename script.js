@@ -2657,28 +2657,25 @@ function renderIncomingShelfLife() {
     ["⚪ No Expiry Date", grey.toLocaleString(), "Cannot calculate", "muted"],
   ]);
 
-  // ISSUE-6 FIX: chart shows Flag distribution by current INVENTORY PLANT
-  // (where the batch is actually held now), not the HO01 receiving sloc —
-  // this is what tells branches which at-risk batches they're holding.
-  const plantMap = {};
+  // CHART UPDATE: Shelf Life at Receipt Flag distribution by HO01 Storage
+  // Location — uses _receiptFlag (Expiry − Posting Date, supplier compliance)
+  // grouped by the storage location the goods were received into.
+  const slocMap = {};
   rows.forEach(r => {
-    const plantsStr = (r._inv_plants && r._inv_plants !== "—") ? r._inv_plants : "(Unmatched)";
-    plantsStr.split(" · ").forEach(p => {
-      const plant = p.trim() || "(Unmatched)";
-      if (!plantMap[plant]) plantMap[plant] = { green:0, yellow:0, red:0, expired:0, grey:0, data_error:0 };
-      const bucket = plantMap[plant][r._flag] !== undefined ? r._flag : (r._dataError ? "data_error" : "grey");
-      plantMap[plant][bucket]++;
-    });
+    const sloc = String(r["Storage Location"] || "").trim() || "(Blank)";
+    if (!slocMap[sloc]) slocMap[sloc] = { green:0, yellow:0, red:0, data_error:0, grey:0 };
+    const bucket = slocMap[sloc][r._receiptFlag] !== undefined ? r._receiptFlag : "grey";
+    slocMap[sloc][bucket]++;
   });
-  const plants = Object.keys(plantMap).sort();
+  const slocs = Object.keys(slocMap).sort();
   Plotly.newPlot("isl-chart-sloc", [
-    { name:"🟢 Green",   x: plants, y: plants.map(p => plantMap[p].green),      type:"bar", marker:{ color:"#3fb950" } },
-    { name:"🟡 Yellow",  x: plants, y: plants.map(p => plantMap[p].yellow),     type:"bar", marker:{ color:"#d29922" } },
-    { name:"🔴 Red",     x: plants, y: plants.map(p => plantMap[p].red),        type:"bar", marker:{ color:"#f85149" } },
-    { name:"⛔ Expired", x: plants, y: plants.map(p => plantMap[p].expired),    type:"bar", marker:{ color:"#7f1d1d" } },
-    { name:"⚠ Data Error", x: plants, y: plants.map(p => plantMap[p].data_error), type:"bar", marker:{ color:"#a371f7" } },
-    { name:"⚪ No Expiry", x: plants, y: plants.map(p => plantMap[p].grey),     type:"bar", marker:{ color:"#6e7681" } },
-  ], { ...pl(), barmode:"stack", height:280, title:"Flag Distribution by Current Inventory Plant" }, PLOTLY_CONFIG);
+    { name:"🟢 Green (>2yr)",        x: slocs, y: slocs.map(s => slocMap[s].green),      type:"bar", marker:{ color:"#3fb950" } },
+    { name:"🟡 Yellow (1.5-2yr)",    x: slocs, y: slocs.map(s => slocMap[s].yellow),     type:"bar", marker:{ color:"#d29922" } },
+    { name:"🔴 Red (<1.5yr)",        x: slocs, y: slocs.map(s => slocMap[s].red),        type:"bar", marker:{ color:"#f85149" } },
+    { name:"⚠ Data Error",          x: slocs, y: slocs.map(s => slocMap[s].data_error), type:"bar", marker:{ color:"#a371f7" } },
+    { name:"⚪ No Expiry Date",      x: slocs, y: slocs.map(s => slocMap[s].grey),       type:"bar", marker:{ color:"#6e7681" } },
+  ], { ...pl(), barmode:"stack", height:280, title:"Shelf Life at Receipt Flag Distribution by Storage Location" }, PLOTLY_CONFIG);
+
 
   // Count info
   const countEl = document.getElementById("isl-count");
