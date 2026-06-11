@@ -16,8 +16,14 @@
  */
 function isMedicalCode(code) {
   if (!code) return false;
-  const c = String(code).trim();
+  // BUG-FIX-5: uppercase before all checks so this function is the true public
+  // inverse of isNonMedicalCode regardless of input case. Previously a lowercase
+  // "nt12345" passed directly to isMedicalCode would skip the NT guard and fall
+  // through to the /^[1234]/ test — returning false (correct by accident, but
+  // inconsistent with the documented contract).
+  const c = String(code).trim().toUpperCase();
   if (!c) return false;
+  if (c.startsWith("NT")) return false; // NT = Non-Trade → not a medical code
   return /^[1234]/.test(c);
 }
 
@@ -35,13 +41,10 @@ function isMedicalCode(code) {
  */
 function isNonMedicalCode(code) {
   if (!code) return true;
-  const c = String(code).trim().toUpperCase();
+  const c = String(code).trim();
   if (!c) return true;
-
-  // Non-Trade prefix — excluded even though it starts with a letter, not 1-4
-  if (c.startsWith("NT")) return true;
-
-  // Delegate to isMedicalCode for the numeric prefix check
+  // BUG-FIX-5: delegate entirely to isMedicalCode (which now handles NT prefix
+  // and uppercasing), so the two functions are guaranteed to be true inverses.
   return !isMedicalCode(c);
 }
 
