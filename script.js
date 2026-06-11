@@ -2713,15 +2713,11 @@ function renderIncomingShelfLife() {
       fmt: v => _islReceiptFlagLabel(v), raw: true },
     // SL Remaining Today: Expiry − Today (distribution urgency)
     { key:"_remainingSL",         label:"SL Remaining Today (days)",  fmt: v => _islFmtDays(v) },
-    { key:"_ratio",               label:"SL Remaining %",
-      fmt: (v, r) => _islBarHtml(v, r._flag), raw: true },
-    { key:"_flag",                label:"Flag",
-      fmt: v => _islFlagLabel(v), raw: true },
     // ── Current inventory distribution (all branches) ──
     { key:"_inv_plants",          label:"Plants in Inventory",
-      fmt: v => v ? `<span style="font-size:0.75rem">${escHtml(String(v))}</span>` : "—", raw: true },
+      fmt: v => v ? `<span style="font-size:0.7rem;white-space:nowrap">${escHtml(String(v))}</span>` : "—", raw: true },
     { key:"_inv_slocs",           label:"Inventory Slocs",
-      fmt: v => v ? `<span style="font-size:0.72rem;color:var(--muted)">${escHtml(String(v))}</span>` : "—", raw: true },
+      fmt: v => v ? `<span style="font-size:0.68rem;color:var(--muted);white-space:nowrap">${escHtml(String(v))}</span>` : "—", raw: true },
     { key:"_inv_totalQty",        label:"Total Inv. Qty",
       fmt: v => (v !== undefined && v !== null) ? fmtQty(v) : "—" },
   ];
@@ -2750,7 +2746,6 @@ function renderIncomingShelfLife() {
 
   // ── Download helpers ────────────────────────────────────────────────────────
   // Flatten a row for export: strip HTML from raw columns, format dates/ratios
-  const FLAG_LABEL = { green:"Green (>1yr left)", yellow:"Yellow (9mo-1yr)", red:"Red (<9mo left)", expired:"EXPIRED", grey:"No Expiry Date" };
   const RECEIPT_FLAG_LABEL = { green:">2yr", yellow:"1.5-2yr", red:"<1.5yr", data_error:"Data Error (posting after expiry)", grey:"—" };
 
   function _islFlatRow(r) {
@@ -2768,8 +2763,6 @@ function renderIncomingShelfLife() {
       "SL at Receipt (days)":     r._slAtReceiptDays !== null && r._slAtReceiptDays !== undefined ? r._slAtReceiptDays : "",
       "SL at Receipt Flag":       RECEIPT_FLAG_LABEL[r._receiptFlag] || r._receiptFlag || "",
       "SL Remaining Today (days)": r._remainingSL !== null && r._remainingSL !== undefined ? r._remainingSL : "",
-      "SL Remaining %":           r._ratio !== null && r._ratio !== undefined ? +((r._ratio*100).toFixed(2)) : "",
-      "Flag":                     FLAG_LABEL[r._flag] || r._flag || "",
       "Plants in Inventory":      r._inv_plants  || "",
       "Inventory Slocs":          r._inv_slocs   || "",
       "Total Inv. Qty":           r._inv_totalQty !== undefined ? r._inv_totalQty : "",
@@ -2783,7 +2776,7 @@ function renderIncomingShelfLife() {
     "HO01 Receipt Sloc","Latest Posting Date","Total Qty Received","# GR Postings",
     "GR Document No. (latest)","Expiry Date (Inv)",
     "SL at Receipt (days)","SL at Receipt Flag",
-    "SL Remaining Today (days)","SL Remaining %","Flag",
+    "SL Remaining Today (days)",
     "Plants in Inventory","Inventory Slocs","Total Inv. Qty",
   ];
   const exportColDefs = EXPORT_KEYS.map(k => ({ key: k, label: k }));
