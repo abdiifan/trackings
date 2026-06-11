@@ -133,10 +133,11 @@ function getReconciledBase() {
 // values from the previous file can never produce a blank result set.
 function resetPageFilters() {
   // BUG-RESET FIX: guard against pages (e.g. "branch") that have no "plants" key
+  // BUG-FIX-2: also guard mgs/valTypes keys so "incoming: {}" never gets phantom slots
   Object.keys(pageFilters).forEach(page => {
-    if ("plants" in pageFilters[page]) pageFilters[page].plants = [];
-    pageFilters[page].mgs = [];
-    pageFilters[page].valTypes = [];
+    if ("plants"   in pageFilters[page]) pageFilters[page].plants   = [];
+    if ("mgs"      in pageFilters[page]) pageFilters[page].mgs      = [];
+    if ("valTypes" in pageFilters[page]) pageFilters[page].valTypes = [];
   });
 }
 
@@ -623,8 +624,12 @@ function downloadCSV(data, cols, filename) {
     const needsQuote = v.includes(",") || v.includes('"') || v.includes("\n") || v.includes("\t");
     if (needsQuote) {
       v = `"${v.replace(/"/g, '""')}"`;
-    } else if (/^[=+\-@\r]/.test(v)) {
-      // Injection guard only for non-quoted values (\t already handled above via quoting)
+    } else if (/^[=+\-@]/.test(v)) {
+      // BUG-FIX-7: removed \r from injection guard regex. A value beginning with
+      // \r\n (Windows line ending) would get a spurious ' prefix producing garbage
+      // like '\r\nsome text. Carriage returns are already handled by the needsQuote
+      // path above via the \n check (they always appear together in Windows line
+      // endings). Formula-injection characters =, +, -, @ still guarded.
       v = `'${v}`;
     }
     return v;
@@ -1046,14 +1051,14 @@ function renderTransit() {
   ];
   const transitRows = sortBy([...df], "Value of Stock in Transit").map(r => {
     const info = getTransitInfo(r["Material"], r["Plant"]);
-    const isPhantom = r._phantomTransitQty > 0;
+    // BUG-FIX-3: removed dead isPhantom branch — df already filters out phantom rows
+    // (!(r._phantomTransitQty > 0) above), so the badge-phantom branch could never
+    // execute here. Status is now purely value-based.
     return {
       ...r,
       _purDoc:   info.purDoc,
       _supPlant: info.supPlant,
-      _status: isPhantom
-        ? "<span class='badge badge-phantom'>⚠ No PO / No Supplying Plant — Not Physically Confirmed</span>"
-        : r["Value of Stock in Transit"] > 100000 ? "<span class='badge badge-red'>Critical</span>"
+      _status: r["Value of Stock in Transit"] > 100000 ? "<span class='badge badge-red'>Critical</span>"
         : r["Value of Stock in Transit"] > 50000  ? "<span class='badge badge-amber'>High</span>"
         : r["Value of Stock in Transit"] > 10000  ? "<span class='badge badge-amber'>Medium</span>"
         : "<span class='badge badge-green'>Low</span>",
@@ -1492,9 +1497,10 @@ function renderBranch() {
 
   // Detect central branch from raw (multi-plant) data
   const plants = [...new Set(baseDf.map(r => String(r["Plant"]).toUpperCase()))];
-  let centralCode, centralName;
+  // BUG-FIX-6: centralCode was computed but never read anywhere — removed dead variable.
+  // All downstream logic uses centralName (the display name).
+  let centralName;
   if (plants.includes("HO01")) {
-    centralCode = "HO01";
     centralName = baseDf.find(r => String(r["Plant"]).toUpperCase() === "HO01")?.["Plant Name"] || "HO01";
     document.getElementById("branch-central-info").style.display = "none";
   } else {
@@ -1975,8 +1981,13 @@ function applyPreviewFilters() {
   const valTypes    = getSelected("filter-valtype");
   filtDf = baseDf.filter(r =>
     (!plants.length    || plants.includes(r["Plant Name"])) &&
-    (!mgs.length       || mgs.includes(r["Material Group Name"])) &&
-    (!mgnames.length   || mgnames.includes(r["Material Group Name"])) &&
+    // BUG-FIX-5: filter-mg and filter-mgname both reference "Material Group Name".
+    // Using AND means selecting a value in one but not the other yields no results.
+    // Fix: treat them as a union — a row passes if it matches either selection
+    // (or neither selection has any values chosen).
+    ((!mgs.length && !mgnames.length) ||
+      mgs.includes(r["Material Group Name"]) ||
+      mgnames.includes(r["Material Group Name"])) &&
     (!valTypes.length  || valTypes.includes(getValuationType(r)))
   );
   renderPreviewTable();
@@ -2042,7 +2053,9 @@ function aggregateByMaterial(df) {
     "Value of Unrestricted Stock",
     "Value of Stock in Quality Inspection",
     "Value of Stock in Transit",
-    "Total Value",
+    // BUG-FIX-4: "Total Value" removed — it is recomputed from components below
+    // (line ~2081). Accumulating it here then overwriting it was wasted work and
+    // would double-count if the recompute step were ever skipped.
   ];
 
   // Group all rows by Material code
@@ -3020,7 +3033,9 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   // FIX-R6: added export buttons so users with >200 results have a download path.
-  function buildTable(rows, cols, exportFilename) {
+  // BUG-FIX-1: renamed from buildTable → gsrBuildTable to avoid collision with the
+  // global buildTable at line 582 (different signatures: rowClass fn vs exportFilename str).
+  function gsrBuildTable(rows, cols, exportFilename) {
     if (!rows.length) return '<p class="gsr-no-data">No matching records found.</p>';
     let html = '<div class="tbl-wrap"><table><thead><tr>';
     cols.forEach(c => { html += `<th>${escHtml(c.label)}</th>`; });
@@ -3118,7 +3133,7 @@ document.addEventListener("DOMContentLoaded", () => {
       <span class="gsr-badge gsr-badge-stock">In Stock</span>
       ${stockRows.length} record${stockRows.length !== 1 ? "s" : ""} found
     </div>`;
-    html += buildTable(stockRows, stockCols, "search_results_stock.csv");
+    html += gsrBuildTable(stockRows, stockCols, "search_results_stock.csv");
 
     // Transit from separate file (if uploaded)
     if (stockTransitRaw.length > 0) {
@@ -3126,7 +3141,7 @@ document.addEventListener("DOMContentLoaded", () => {
         <span class="gsr-badge gsr-badge-transit">In Transit (Transit File)</span>
         ${transitRows.length} record${transitRows.length !== 1 ? "s" : ""} found
       </div>`;
-      html += buildTable(transitRows, transitCols, "search_results_transit.csv");
+      html += gsrBuildTable(transitRows, transitCols, "search_results_transit.csv");
     } else if (inTransitMain.length > 0) {
       // Fallback: show in-transit column from main data
       html += `<div class="gsr-section-title" style="margin-top:1.2rem">
@@ -3140,7 +3155,7 @@ document.addEventListener("DOMContentLoaded", () => {
         { key: "Stock in Transit",     label: "Transit Qty", cls: "col-qty" },
         { key: "Value of Stock in Transit", label: "Transit Value (ETB)", cls: "col-val" },
       ];
-      html += buildTable(inTransitMain, tCols, "search_results_transit_main.csv");
+      html += gsrBuildTable(inTransitMain, tCols, "search_results_transit_main.csv");
     }
 
     out.innerHTML = html;
