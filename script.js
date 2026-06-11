@@ -2645,14 +2645,13 @@ function renderIncomingShelfLife() {
 
   const rows = _islGetFiltered();
 
-  // KPIs
+  // KPIs — based on SL at Receipt Flag (_receiptFlag)
   const total      = rows.length;
-  const green      = rows.filter(r => r._flag === "green").length;
-  const yellow     = rows.filter(r => r._flag === "yellow").length;
-  const red        = rows.filter(r => r._flag === "red").length;
-  const expired    = rows.filter(r => r._flag === "expired").length;
-  const grey       = rows.filter(r => r._flag === "grey").length;
-  const dataErrors = rows.filter(r => r._dataError).length;
+  const green      = rows.filter(r => r._receiptFlag === "green").length;
+  const yellow     = rows.filter(r => r._receiptFlag === "yellow").length;
+  const red        = rows.filter(r => r._receiptFlag === "red").length;
+  const dataErrors = rows.filter(r => r._receiptFlag === "data_error").length;
+  const grey       = rows.filter(r => r._receiptFlag === "grey").length;
 
   const totalMatched  = incomingRaw.length;
   const totalReceived = _incomingRawAll.length;
@@ -2661,13 +2660,12 @@ function renderIncomingShelfLife() {
     : `${totalMatched.toLocaleString()} batches`;
 
   setKpis("isl-kpis", [
-    ["Matched Batches", total.toLocaleString(), `HO01 · ZME/ZMS/ZLC · ${matchNote}`, "blue"],
-    ["🟢 Green (>1yr left)",  green.toLocaleString(), "Adequate shelf life remaining", "green"],
-    ["🟡 Yellow (9mo-1yr)", yellow.toLocaleString(), "Watch closely", "amber"],
-    ["🔴 Red (<9mo left)",    red.toLocaleString(), "Distribute urgently", "red"],
-    ["⛔ Expired",       expired.toLocaleString(), "Past expiry date", "red"],
-    ["⚠ Data Errors",    dataErrors.toLocaleString(), "Posting date after expiry (SAP)", "purple"],
-    ["⚪ No Expiry Date", grey.toLocaleString(), "Cannot calculate", "muted"],
+    ["Matched Batches",    total.toLocaleString(),      `HO01 · ZME/ZMS/ZLC · ${matchNote}`,  "blue"],
+    ["🟢 Green (>2yr)",    green.toLocaleString(),      "Adequate SL at receipt",              "green"],
+    ["🟡 Yellow (1.5–2yr)", yellow.toLocaleString(),   "Borderline SL at receipt",            "amber"],
+    ["🔴 Red (<1.5yr)",    red.toLocaleString(),        "Short SL at receipt",                 "red"],
+    ["⚠ Data Errors",      dataErrors.toLocaleString(),"Posting date after expiry (SAP)",     "purple"],
+    ["⚪ No Expiry Date",   grey.toLocaleString(),      "Cannot calculate SL at receipt",      "muted"],
   ]);
 
   // CHART UPDATE: Shelf Life at Receipt Flag distribution by HO01 Storage
