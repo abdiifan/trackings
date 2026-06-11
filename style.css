@@ -113,6 +113,7 @@ body { display: flex; }
 .kpi-card.amber::before  { background: var(--amber); }
 .kpi-card.red::before    { background: var(--red); }
 .kpi-card.purple::before { background: var(--purple); }
+.kpi-card.muted::before  { background: var(--muted); }
 .kpi-label { color: var(--muted); font-size: 0.68rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 0.4rem; }
 .kpi-value { color: var(--text); font-family: 'IBM Plex Mono', monospace; font-size: 1.45rem; font-weight: 600; line-height: 1; margin-bottom: 0.25rem; }
 .kpi-sub   { color: var(--dim); font-size: 0.68rem; }
