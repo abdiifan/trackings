@@ -508,6 +508,19 @@
         <span class="isl-dot isl-grey"></span><span>Grey — No Expiry Date / Data Error</span>
       </div>
 
+      <!-- Material Search -->
+      <div class="chart-box full" style="margin-bottom:1rem">
+        <div class="section-header" style="margin-bottom:0.4rem">🔍 Material Search</div>
+        <div style="color:var(--muted);font-size:0.78rem;margin-bottom:0.75rem">Search any material to find its incoming shelf life record</div>
+        <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;margin-bottom:0.75rem">
+          <input id="isl-search-input" type="text" placeholder="Type material code or name…"
+            style="flex:1;min-width:220px;max-width:400px;padding:0.45rem 0.75rem;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-size:0.82rem;outline:none" />
+          <button class="apply-btn small" id="isl-search-btn">Search</button>
+          <button class="apply-btn secondary small" id="isl-search-clear">Clear</button>
+        </div>
+        <div id="isl-search-results"></div>
+      </div>
+
       <!-- Filters -->
       <div class="filter-bar" style="margin-bottom:1rem; flex-wrap:wrap; gap:0.5rem; align-items:center">
         <div>
@@ -545,7 +558,6 @@
             <option value="yellow">🟡 Yellow (9mo-1yr)</option>
             <option value="red">🔴 Red (&lt;9mo left)</option>
             <option value="expired">⛔ Expired</option>
-            <option value="grey">⚪ No Expiry Date</option>
           </select>
         </div>
         <button type="button" class="apply-btn small" id="isl-filter-apply">Apply</button>
